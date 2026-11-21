@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import { GoogleGenAI } from '@google/genai';
 
 const app = express();
 app.use(cors());
@@ -13,7 +14,7 @@ const ai = new GoogleGenAI({ apiKey: apiKey || '' });
 async function generateText(systemPrompt, userPrompt) {
   try {
     const result = await ai.models.generateContent({
-      model: 'gemini-1.5-flash-002',
+      model: 'gemini-3.8-flash',
       config: {
         systemInstruction: { role: 'user', parts: [{ text: systemPrompt }] },
         temperature: 0.7,
