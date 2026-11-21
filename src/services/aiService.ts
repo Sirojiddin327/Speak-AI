@@ -8,47 +8,59 @@ import type {
 
 const ENV = (import.meta as unknown as { env: Record<string, string | undefined> }).env ?? {};
 
-const AI_API_KEY: string | undefined = ENV.VITE_AI_API_KEY;
-const AI_API_URL: string | undefined = ENV.VITE_AI_API_URL;
-const AI_MODEL: string = ENV.VITE_AI_MODEL || 'gpt-4o-mini';
-const AI_PROVIDER: string = ENV.VITE_AI_PROVIDER || (AI_API_URL ? 'custom' : 'none');
+// Read backend URL from env or use default
+const BACKEND_BASE_URL: string = ENV.VITE_BACKEND_URL || 'http://localhost:5000';
+
+// Determine if AI is configured
+const VITE_AI_PROVIDER: string = ENV.VITE_AI_PROVIDER || 'none';
 
 export function getAIStatus(): AICapabilityStatus {
   return {
-    configured: Boolean(AI_API_KEY && AI_API_URL),
-    provider: AI_PROVIDER === 'none' ? null : AI_PROVIDER,
+    configured: VITE_AI_PROVIDER !== 'none',
+    provider: VITE_AI_PROVIDER === 'none' ? null : VITE_AI_PROVIDER,
   };
 }
 
-export const isDemoMode = !getAIStatus().configured;
+// isDemoMode is true when AI is not configured
+export const isDemoMode: boolean = VITE_AI_PROVIDER === 'none';
 
-interface ChatPayload {
-  messages: { role: 'system' | 'user' | 'assistant'; content: string }[];
-  temperature?: number;
-  max_tokens?: number;
-}
+// Check if the backend AI is actually available
+export async function checkAIStatus(): Promise<AICapabilityStatus> {
+  try {
+    const res = await fetch(`${BACKEND_BASE_URL}/api/ai/health`, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(5000),
+    });
+    const data = await res.json();
 
-async function callLLM(systemPrompt: string, userPrompt: string): Promise<string> {
-  if (!AI_API_KEY || !AI_API_URL) {
-    throw new Error('AI_NOT_CONFIGURED');
+    // If backend reports Gemini configured, use that
+    if (data.status === 'ok' && data.geminiConfigured) {
+      return { configured: true, provider: 'gemini' };
+    }
+
+    // Otherwise fall back to the Vite env provider check
+    return {
+      configured: VITE_AI_PROVIDER !== 'none',
+      provider: VITE_AI_PROVIDER === 'none' ? null : VITE_AI_PROVIDER,
+    };
+  } catch {
+    // If backend unreachable, fall back to Vite env check
+    return {
+      configured: VITE_AI_PROVIDER !== 'none',
+      provider: VITE_AI_PROVIDER === 'none' ? null : VITE_AI_PROVIDER,
+    };
   }
+}
 
-  const payload: ChatPayload = {
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ],
-    temperature: 0.6,
-    max_tokens: 600,
-  };
-
-  const res = await fetch(AI_API_URL, {
+// --- LLM Call (backend proxy) ---
+async function callBackendAPI(endpoint: string, body: object): Promise<any> {
+  const res = await fetch(`${BACKEND_BASE_URL}${endpoint}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${AI_API_KEY}`,
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
+    credentials: 'same-origin',
   });
 
   if (!res.ok) {
@@ -56,26 +68,10 @@ async function callLLM(systemPrompt: string, userPrompt: string): Promise<string
     throw new Error(`AI_REQUEST_FAILED (${res.status}): ${text.slice(0, 200)}`);
   }
 
-  const data = await res.json();
-  const content: string | undefined =
-    data?.choices?.[0]?.message?.content ??
-    data?.content ??
-    data?.message ??
-    undefined;
-
-  if (!content) throw new Error('AI_EMPTY_RESPONSE');
-  return content.trim();
+  return res.json();
 }
 
-function tryParseJSON<T>(raw: string): T | null {
-  try {
-    const cleaned = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
-    return JSON.parse(cleaned) as T;
-  } catch {
-    return null;
-  }
-}
-
+// --- Speaking Tutor ---
 export interface SpeakingResponse {
   reply: string;
   feedback: SpeakingFeedback;
@@ -87,40 +83,29 @@ export async function getSpeakingResponse(
   context: ConversationContext,
   history: { role: 'user' | 'assistant'; content: string }[],
 ): Promise<SpeakingResponse> {
-  const systemPrompt = `You are SpeakUz AI, a friendly English speaking tutor for students in Uzbekistan.
-The learner is at CEFR level ${context.level}. Topic: ${context.topic}.
-Rules:
-- Keep replies short (2-4 sentences) and natural.
-- Use accessible vocabulary for the learner's level.
-- Be encouraging and keep the conversation going.
-- After your reply, append a JSON block with feedback on the learner's LAST message.
-Return EXACTLY in this format:
-<conversation reply>
-|||FEEDBACK|||
-{"grammar":"...","vocabulary":"...","fluency":"...","scoreOutOf100":number}`;
-
-  const historyText = history.slice(-6).map((m) => `${m.role}: ${m.content}`).join('\n');
-  const userPrompt = `Conversation so far:\n${historyText}\n\nLearner: ${userText}`;
+  // If not configured, immediately return demo
+  if (!getAIStatus().configured) {
+    return demoSpeakingResponse(userText, context);
+  }
 
   try {
-    const raw = await callLLM(systemPrompt, userPrompt);
-    const [replyPart, feedbackPart] = raw.split('|||FEEDBACK|||');
-    const feedbackJson = tryParseJSON<Omit<SpeakingFeedback, 'scoreOutOf100'> & { scoreOutOf100: number }>(
-      feedbackPart || '{}',
-    );
-    const feedback: SpeakingFeedback = feedbackJson ?? {
-      grammar: 'Feedback unavailable.',
-      vocabulary: 'Feedback unavailable.',
-      fluency: 'Feedback unavailable.',
-      scoreOutOf100: 70,
+    const body = {
+      userText,
+      topic: context.topic,
+      level: context.level,
+      history,
     };
-    return { reply: (replyPart || raw).trim(), feedback, isDemo: false };
-  } catch {
+    const result: SpeakingResponse = await callBackendAPI('/api/ai/speaking', body);
+    // Result from backend has isDemo field - preserve it
+    return result;
+  } catch (err) {
+    console.error('Speaking API error:', err);
+    // Fallback to demo response when backend fails
     return demoSpeakingResponse(userText, context);
   }
 }
 
-function demoSpeakingResponse(userText: string, context: ConversationContext): SpeakingResponse {
+function demoSpeakingResponse(userText: string, context: ConversationContext) {
   const lower = userText.toLowerCase();
   const replies: Record<string, string> = {
     greeting: "Hello! I'm glad you're practicing. Tell me, what did you do yesterday?",
@@ -160,22 +145,23 @@ function demoSpeakingResponse(userText: string, context: ConversationContext): S
   };
 }
 
+// --- Writing Checker ---
 export interface WritingResponse {
   feedback: WritingFeedback;
   isDemo: boolean;
 }
 
 export async function getWritingFeedback(essay: string): Promise<WritingResponse> {
-  const systemPrompt = `You are SpeakUz AI's writing evaluator. Analyze the learner's English essay.
-Return ONLY JSON in this shape:
-{"grammar":{"score":0-100,"notes":[...]},"vocabulary":{"score":0-100,"notes":[...]},"coherence":{"score":0-100,"notes":[...]},"cefrLevel":"A1|A2|B1|B2|C1|C2","suggestions":[...],"overallScore":0-100}`;
+  // If not configured, immediately return demo
+  if (!getAIStatus().configured) {
+    return demoWritingFeedback(essay);
+  }
 
   try {
-    const raw = await callLLM(systemPrompt, `Essay:\n${essay}`);
-    const parsed = tryParseJSON<WritingFeedback>(raw);
-    if (!parsed) throw new Error('AI_PARSE_FAILED');
-    return { feedback: parsed, isDemo: false };
-  } catch {
+    const result: WritingResponse = await callBackendAPI('/api/ai/writing', { essay });
+    return result;
+  } catch (err) {
+    console.error('Writing API error:', err);
     return demoWritingFeedback(essay);
   }
 }
@@ -197,12 +183,15 @@ function demoWritingFeedback(essay: string): WritingResponse {
   if (!hasCapital) grammarNotes.push('Start your essay with a capital letter.');
   if (!hasEndPunct) grammarNotes.push('Add a closing punctuation mark at the end.');
   const lower = essay.toLowerCase();
-  if (/\bi is\b|\bi are\b|\she are\b|\sshe are\b/.test(lower)) grammarNotes.push('Subject-verb agreement: check "I am / he is / she is".');
-  if (grammarNotes.length === 0) grammarNotes.push('Grammar is largely correct for this level. Keep practicing varied tenses.');
+  if (/\bi is\b|\bi are\b|\nshe are\b|\sshe are\b/.test(lower))
+    grammarNotes.push('Subject-verb agreement: check "I am / he is / she is".');
+  if (grammarNotes.length === 0)
+    grammarNotes.push('Grammar is largely correct for this level. Keep practicing varied tenses.');
 
   const uniqueWords = new Set(words.map((w) => w.toLowerCase().replace(/[^a-z']/g, '')));
   const lexicalDiversity = wordCount ? uniqueWords.size / wordCount : 0;
-  if (lexicalDiversity < 0.4 && wordCount > 20) vocabNotes.push('You repeat some words. Try synonyms to enrich vocabulary.');
+  if (lexicalDiversity < 0.4 && wordCount > 20)
+    vocabNotes.push('You repeat some words. Try synonyms to enrich vocabulary.');
   else vocabNotes.push('Good range of vocabulary. Add a few advanced linking words (however, therefore, in addition).');
 
   if (sentenceCount < 3) coherenceNotes.push('Use multiple sentences to develop your ideas.');
@@ -235,52 +224,142 @@ function demoWritingFeedback(essay: string): WritingResponse {
   };
 }
 
-export interface PronunciationResponse {
-  result: PronunciationResult;
+// --- CEFR Practice Feedback ---
+export interface CefrFeedbackResponse {
+  estimatedLevel: CefrLevel;
+  score: number;
+  total: number;
+  perLevel: Record<CefrLevel, { correct: number; total: number }>;
   isDemo: boolean;
 }
 
-export async function getPronunciationAnalysis(transcript: string, targetPhrase: string): Promise<PronunciationResponse> {
-  const systemPrompt = `You are a pronunciation assistant. Compare the learner's transcript to the target phrase.
-Return ONLY JSON: {"words":[{"word":"...","status":"good|review|difficult","note":"..."}],"overallScore":0-100,"recommendations":[...]}`;
+export async function getCefrFeedback(answers: (number | null)[]): Promise<CefrFeedbackResponse> {
+  // If not configured, immediately return demo (using client-side calculation)
+  if (!getAIStatus().configured) {
+    const LEVEL_ORDER: CefrLevel[] = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
+    const perLevel: Record<CefrLevel, { correct: number; total: number }> = {
+      A1: { correct: 0, total: 0 },
+      A2: { correct: 0, total: 0 },
+      B1: { correct: 0, total: 0 },
+      B2: { correct: 0, total: 0 },
+      C1: { correct: 0, total: 0 },
+      C2: { correct: 0, total: 0 },
+    };
+
+    let score = 0;
+    answers.forEach((a) => { if (a !== null) score++; });
+
+    const order: CefrLevel[] = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
+    let estimatedLevel: CefrLevel = 'A1';
+    for (const lvl of order) {
+      const stat = perLevel[lvl];
+      if (stat.total > 0 && stat.correct / stat.total >= 0.5) {
+        estimatedLevel = lvl;
+      } else {
+        break;
+      }
+    }
+
+    return {
+      estimatedLevel,
+      score,
+      total: answers.length,
+      perLevel,
+      isDemo: true,
+    };
+  }
+
+  // If configured, try backend
   try {
-    const raw = await callLLM(systemPrompt, `Target phrase: ${targetPhrase}\nLearner transcript: ${transcript}`);
-    const parsed = tryParseJSON<PronunciationResult>(raw);
-    if (!parsed) throw new Error('AI_PARSE_FAILED');
-    return { result: parsed, isDemo: false };
-  } catch {
-    return demoPronunciation(transcript, targetPhrase);
+    const result: CefrFeedbackResponse = await callBackendAPI('/api/ai/cefr', { answers });
+    return result;
+  } catch (err) {
+    console.error('CEFR API error:', err);
+    // Fallback to client-side calculation
+    const LEVEL_ORDER: CefrLevel[] = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
+    const perLevel: Record<CefrLevel, { correct: number; total: number }> = {
+      A1: { correct: 0, total: 0 },
+      A2: { correct: 0, total: 0 },
+      B1: { correct: 0, total: 0 },
+      B2: { correct: 0, total: 0 },
+      C1: { correct: 0, total: 0 },
+      C2: { correct: 0, total: 0 },
+    };
+
+    let score = 0;
+    answers.forEach((a) => { if (a !== null) score++; });
+
+    const order: CefrLevel[] = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
+    let estimatedLevel: CefrLevel = 'A1';
+    for (const lvl of order) {
+      const stat = perLevel[lvl];
+      if (stat.total > 0 && stat.correct / stat.total >= 0.5) {
+        estimatedLevel = lvl;
+      } else {
+        break;
+      }
+    }
+
+    return {
+      estimatedLevel,
+      score,
+      total: answers.length,
+      perLevel,
+      isDemo: true,
+    };
   }
 }
 
-function demoPronunciation(transcript: string, targetPhrase: string): PronunciationResponse {
-  const targetWords = targetPhrase.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(Boolean);
-  const spokenWords = transcript.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(Boolean);
-  const spokenSet = new Set(spokenWords);
+// --- Pronunciation Analysis (backward compatibility) ---
+export function getPronunciationAnalysis(
+  transcript: string,
+  targetPhrase: string
+): Promise<{
+  result: PronunciationResult;
+  isDemo: boolean;
+}> {
+  // If not configured, return demo analysis
+  if (isDemoMode) {
+    const targetWords = targetPhrase.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(Boolean);
+    const spokenWords = transcript.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(Boolean);
+    const spokenSet = new Set(spokenWords);
 
-  const words = targetWords.map((w) => {
-    if (spokenSet.has(w)) return { word: w, status: 'good' as const };
-    if (spokenWords.some((s) => s.startsWith(w.slice(0, 3)) || w.startsWith(s.slice(0, 3)))) {
-      return { word: w, status: 'review' as const, note: 'Possibly mispronounced — listen and retry.' };
-    }
-    return { word: w, status: 'difficult' as const, note: 'Word missing or unclear. Say it slowly.' };
-  });
+    const words = targetWords.map((w) => {
+      if (spokenSet.has(w)) return { word: w, status: 'good' as const };
+      if (spokenWords.some((s) => s.startsWith(w.slice(0, 3)) || w.startsWith(s.slice(0, 3)))) {
+        return { word: w, status: 'review' as const, note: 'Possibly mispronounced — listen and retry.' };
+      }
+      return { word: w, status: 'difficult' as const, note: 'Word missing or unclear. Say it slowly.' };
+    });
 
-  const goodCount = words.filter((w) => w.status === 'good').length;
-  const score = Math.round((goodCount / Math.max(1, targetWords.length)) * 100);
+    const goodCount = words.filter((w) => w.status === 'good').length;
+    const score = Math.round((goodCount / Math.max(1, targetWords.length)) * 100);
 
-  const recommendations: string[] = [];
-  if (score < 70) recommendations.push('Slow down and articulate each word.');
-  recommendations.push('Practice difficult words in isolation first.');
-  recommendations.push('Record yourself and compare with a native pronunciation sample.');
+    const recommendations: string[] = [];
+    if (score < 70) recommendations.push('Slow down and articulate each word.');
+    recommendations.push('Practice difficult words in isolation first.');
+    recommendations.push('Record yourself and compare with a native pronunciation sample.');
 
-  return {
+    return Promise.resolve({
+      result: {
+        transcript,
+        words,
+        overallScore: Math.max(20, score),
+        recommendations,
+      },
+      isDemo: true,
+    });
+  }
+
+  // Configured but no backend call - return demo for now
+  // In a full implementation, this would call /api/ai/pronunciation
+  return Promise.resolve({
     result: {
       transcript,
-      words,
-      overallScore: Math.max(20, score),
-      recommendations,
+      words: [],
+      overallScore: 0,
+      recommendations: ['Backend integration pending.'],
     },
     isDemo: true,
-  };
+  });
 }
